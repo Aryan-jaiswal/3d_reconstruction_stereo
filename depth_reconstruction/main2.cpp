@@ -83,7 +83,7 @@
 
 #define baseline 12
 #define focal 358
-#define kMapResolution 0.2
+#define kMapResolution 0.05
 
 using namespace cv;
 using namespace std;
@@ -95,9 +95,9 @@ sensor_msgs::ImagePtr disp_msg_l, disp_msg_r, disp_msg;
 cv::Mat left, right, img_left, img_right, img_left_c, img_right_c;
 
 Vec3d T;
-Eigen::MatrixXd _Q,_XR,_XT;
-Eigen::Vector3d quad_trans;
-Eigen::Quaterniond quad_rot;
+Eigen::MatrixXd _Q(4,4),_XR,_XT;
+Eigen::Vector3d quad_trans(0,0,0);
+Eigen::Quaterniond quad_rot(1,0,0,0);
 int from_to[] = {0,0,1,1}, stream;
 bool isDispAvailable;
 FileStorage calib_file;
@@ -119,6 +119,11 @@ volatile sig_atomic_t flag=0;
 //#define EIGEN_DONT_PARALLELIZE
 #define EIGEN_FAST_MATH 1
 
+double scale_factor = 0.25;
+int o_width = 752;
+int o_height = 480;
+int max_disp = 160;
+
 //void set_flag()
 //{
 //    flag=1;
@@ -134,11 +139,12 @@ void generateDisparityMap() {
     img_right.copyTo(img_right_c);    
     lk.unlock();
 
-    elas->process(::img_left_c,::img_right_c,leftdpf,100);
+    elas->process(::img_left_c,::img_right_c,leftdpf,(int)(max_disp*scale_factor));
     if(debug_couts) cout<<"disparity generated\n";
     
     std::lock_guard<std::mutex> lk2(dmtx);
     leftdpf.convertTo(disp, CV_8U, 1.0);
+    //leftdpf.copyTo(disp);
     if(debug_couts) cout<<"disparity available\n";
     dcv.notify_one();
     
@@ -156,12 +162,11 @@ void publishPointCloud(ros::Publisher _m_octomap_pub) {
     map_msg.binary = true;
     map_msg.id = "OcTree";
     map_msg.resolution = kMapResolution;
-    
+    std::shared_ptr<octomap::OcTree> map_ptr = std::make_shared<octomap::OcTree>(kMapResolution);
+    octomap::OcTree* tree = map_ptr.get();
 
     while(run_thread){
         
-    std::shared_ptr<octomap::OcTree> map_ptr = std::make_shared<octomap::OcTree>(kMapResolution);
-    octomap::OcTree* tree = map_ptr.get();
     
     std::unique_lock<std::mutex> lk(dmtx);
     dcv.wait(lk);
@@ -205,8 +210,9 @@ void publishPointCloud(ros::Publisher _m_octomap_pub) {
         //point3d_robot = _XR * point3d_cam + _XT;
         //transform from robot frame to world frame
         point_w_world = R_quad_world * point3d_robot + quad_trans;
-        
-        tree->updateNode(point_w_world(0,0), point_w_world(1,0), point_w_world(2,0), true);
+        if(point3d_robot(2,0) > 0)
+        //tree->updateNode(point_w_world(0,0), point_w_world(1,0), point_w_world(2,0), true);
+        tree->updateNode(point3d_robot(0,0), point3d_robot(1,0), point3d_robot(2,0), true);
       }
     }
     if(debug_couts) cout<<"octomap processed\n";
@@ -219,8 +225,8 @@ void publishPointCloud(ros::Publisher _m_octomap_pub) {
 void findRectificationMap(Size finalSize) {
   Rect validRoi[2];
   cout << "Starting rectification" << endl;
-  stereoRectify(K1, D1, K2, D2, calib_img_size, R, Mat(T), R1, R2, P1, P2, Q, 
-                CV_CALIB_ZERO_DISPARITY, 0, finalSize, &validRoi[0], &validRoi[1]);
+  //stereoRectify(K1, D1, K2, D2, calib_img_size, R, Mat(T), R1, R2, P1, P2, Q, 
+   //             CV_CALIB_ZERO_DISPARITY, 0, finalSize, &validRoi[0], &validRoi[1]);
   cv::initUndistortRectifyMap(K1, D1, R1, P1, finalSize, CV_32F, lmapx, lmapy);
   cv::initUndistortRectifyMap(K2, D2, R2, P2, finalSize, CV_32F, rmapx, rmapy);
   cout << "Done rectification" << endl;
@@ -264,6 +270,19 @@ void extract_left_right(const cv::Mat & raw)  {
   // raw[1] -> right[0]
   cv::mixChannels( &raw, 1, out, 2, from_to, 2 );
 }
+void calculateQ() {
+
+    _Q.setZero();
+    _Q(0, 0) = 1.0;
+    _Q(1, 1) = 1.0;
+    _Q(0, 3) = -K1.at<double>(0,2);
+    _Q(1, 3) = -K1.at<double>(1,2);
+    double focal_length = (K1.at<double>(0,0) + K1.at<double>(1,1))/2;
+    _Q(2, 3) = focal_length;
+    double T = P2.at<double>(0,3)/focal_length;
+    _Q(3, 2) = -1./T;
+    _Q(3, 3) = (K1.at<double>(0,2)- K2.at<double>(0,2)) / T;
+}
 
 
 
@@ -272,9 +291,6 @@ int main(int argc, char** argv) {
     ros::init(argc, argv, "demo");
     ros::NodeHandle nh;
     image_transport::ImageTransport it(nh);
-
-    elas = new StereoEfficientLargeScale(0,40);
-    //signal(SIGINT,set_flag);
 
     const char* left_img_topic;
     const char* right_img_topic;
@@ -298,22 +314,50 @@ int main(int argc, char** argv) {
     int c;
     while((c = popt.getNextOpt()) >= 0) {}
 
-    calib_img_size = Size(188,120);
-    out_img_size = Size(188,120);
-
     calib_file = FileStorage(calib_file_name, FileStorage::READ);
     calib_file["K1"] >> K1;
     calib_file["K2"] >> K2;
     calib_file["D1"] >> D1;
     calib_file["D2"] >> D2;
-    calib_file["R"] >> R;
-    calib_file["T"] >> T;
+    calib_file["R1"] >> R1;
+    calib_file["R2"] >> R2;
+    calib_file["P1"] >> P1;
+    calib_file["P2"] >> P2;
     calib_file["XR"] >> XR;
     calib_file["XT"] >> XT;
+    calib_file["SF"] >> scale_factor;
 
+    calib_img_size = Size((int)(o_width*scale_factor),(int)(o_height*scale_factor));
+    out_img_size = Size((int)(o_width*scale_factor),(int)(o_height*scale_factor));
+    
+    K1.at<double>(0,0) = K1.at<double>(0,0)*scale_factor;
+    K1.at<double>(0,2) = K1.at<double>(0,2)*scale_factor;
+    K1.at<double>(1,1) = K1.at<double>(1,1)*scale_factor;
+    K1.at<double>(1,2) = K1.at<double>(1,2)*scale_factor;
+
+    K2.at<double>(0,0) = K2.at<double>(0,0)*scale_factor;
+    K2.at<double>(0,2) = K2.at<double>(0,2)*scale_factor;
+    K2.at<double>(1,1) = K2.at<double>(1,1)*scale_factor;
+    K2.at<double>(1,2) = K2.at<double>(1,2)*scale_factor;
+
+    P1.at<double>(0,0) = P1.at<double>(0,0)*scale_factor;
+    P1.at<double>(0,2) = P1.at<double>(0,2)*scale_factor;
+    P1.at<double>(1,1) = P1.at<double>(1,1)*scale_factor;
+    P1.at<double>(1,2) = P1.at<double>(1,2)*scale_factor;
+
+    P2.at<double>(0,0) = P2.at<double>(0,0)*scale_factor;
+    P2.at<double>(0,2) = P2.at<double>(0,2)*scale_factor;
+    P2.at<double>(0,3) = P2.at<double>(0,3)*scale_factor;
+    P2.at<double>(1,1) = P2.at<double>(1,1)*scale_factor;
+    P2.at<double>(1,2) = P2.at<double>(1,2)*scale_factor;
+    
+    cout << "Scale Factor: " << scale_factor << endl;
+
+    elas = new StereoEfficientLargeScale(0,(int)(max_disp*scale_factor));
     findRectificationMap(out_img_size);
 
-    cv2eigen(Q,_Q);
+    //cv2eigen(Q,_Q);
+    calculateQ();
     cv2eigen(XR,_XR);
     cv2eigen(XT,_XT);
 
@@ -335,7 +379,7 @@ int main(int argc, char** argv) {
 
     cap >> frame_in; if (frame_in.empty()) return -1;
 
-    cv::Size s(188,120);
+    cv::Size s((int)(o_width*scale_factor),(int)(o_height*scale_factor));
     cv::resize(frame_in, frame, s);
 
     ::left = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
@@ -365,9 +409,9 @@ int main(int argc, char** argv) {
         remap(::right, ::img_right, rmapx, rmapy, cv::INTER_LINEAR);
 
 
-        disp_msg_l = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::left).toImageMsg();
+        disp_msg_l = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::img_left).toImageMsg();
         dmap_pub_l.publish(disp_msg_l);
-        disp_msg_r = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::right).toImageMsg();
+        disp_msg_r = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::img_right).toImageMsg();
         dmap_pub_r.publish(disp_msg_r);
 
         if(debug_couts) cout<<"finished grabbing image\n";

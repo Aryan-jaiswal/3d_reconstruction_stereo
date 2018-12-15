@@ -22,9 +22,9 @@ Street, Fifth Floor, Boston, MA 02110-1301, USA
 #ifndef __FILTER_H__
 #define __FILTER_H__
 #include "StereoEfficientLargeScale.h"
-#include <emmintrin.h>
-#include <pmmintrin.h>
-
+//#include <emmintrin.h>
+//#include <pmmintrin.h>
+#include "sse2neon.h"
 // define fixed-width datatypes for Visual Studio projects
 //#ifndef _MSC_VER
 //  #include <stdint.h>

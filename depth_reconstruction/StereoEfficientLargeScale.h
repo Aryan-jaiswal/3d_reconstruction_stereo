@@ -1,5 +1,6 @@
 #pragma once
 #include <opencv2/opencv.hpp>
+#include "sse2neon.h"
 using namespace cv;
 
 // define fixed-width datatypes for Visual Studio projects

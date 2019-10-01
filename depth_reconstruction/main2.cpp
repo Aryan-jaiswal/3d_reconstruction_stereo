@@ -5,7 +5,9 @@
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <thread>
+#include <condition_variable>
 #include <mutex>
+#include <signal.h>
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/ChannelFloat32.h>
 #include <geometry_msgs/Point32.h>
@@ -81,158 +83,157 @@
 
 #define baseline 12
 #define focal 358
-#define kMapResolution 0.2
+#define kMapResolution 0.05
 
 using namespace cv;
 using namespace std;
 
 Mat Q, P1, P2, XR, XT;
 Mat R1, R2, K1, K2, D1, D2, R;
-//Mat *out;
-Mat lmapx, lmapy, rmapx, rmapy, disp;
-cv::Mat left, right;
+
+Mat lmapx, lmapy, rmapx, rmapy, disp, disp_c;
+sensor_msgs::ImagePtr disp_msg_l, disp_msg_r, disp_msg;
+cv::Mat left, right, img_left, img_right, img_left_c, img_right_c;
+
 Vec3d T;
-Eigen::MatrixXd _Q,_XR,_XT;
-Eigen::Vector3d quad_trans;
-Eigen::Quaterniond quad_rot;
+Eigen::MatrixXd _Q(4,4),_XR,_XT;
+Eigen::Vector3d quad_trans(0,0,0);
+Eigen::Quaterniond quad_rot(1,0,0,0);
 int from_to[] = {0,0,1,1}, stream;
 bool isDispAvailable;
 FileStorage calib_file;
 Size out_img_size;
 Size calib_img_size;
 
-image_transport::Publisher dmap_pub;
+image_transport::Publisher dmap_pub_l,dmap_pub_r, disp_pub;
 ros::Publisher _m_octomap_pub;
 ros::Subscriber _global_pose;
 Mat leftdpf;
 StereoEfficientLargeScale * elas;
-std::mutex mtx;
+leftdpf.convertTo(disp, CV_8U, 1./8);
+//    
+std::mutex mtx, dmtx;
 bool run_thread;
+bool publish_disparity = true;
+bool debug_couts = false;
+std::condition_variable mcv;
+std::condition_variable dcv;
+volatile sig_atomic_t flag=0;
+//#define EIGEN_DONT_PARALLELIZE
+#define EIGEN_FAST_MATH 1
+
+double scale_factor = 0.25;
+int o_width = 752;
+int o_height = 480;
+int max_disp = 160;
+
+//void set_flag()
+//{
+//    flag=1;
+//}
 
 void generateDisparityMap() {
  
  while(run_thread){
-    if (::left.empty() || ::right.empty()) 
-      continue;
+    std::unique_lock<std::mutex> lk(mtx);
+    mcv.wait(lk);
+    if(debug_couts) cout<<"disparity wait finished\n";
+    img_left.copyTo(img_left_c);
+    img_right.copyTo(img_right_c);    
+    lk.unlock();
+
+    elas->process(::img_left_c,::img_right_c,leftdpf,(int)(max_disp*scale_factor));
+    if(debug_couts) cout<<"disparity generated\n";
     
-    ////////////////////
-   // cout<<" Called_gdm_init"<<endl;
-    mtx.lock();
-   // cout<<" Called_gdm"<<endl;
-    elas->process(::left,::right,leftdpf,100);
-    //cout<<" Called_elas"<<endl;
-    leftdpf.convertTo(disp, CV_8U, 1./8);
-    mtx.unlock();
-   // cout<<" Called_elas2"<<endl;
-    mtx.lock();
-    isDispAvailable = true;
-    mtx.unlock();
-    //cout<<" Called_exxit"<<endl;
+    std::lock_guard<std::mutex> lk2(dmtx);
+    leftdpf.convertTo(disp, CV_8U, 1.0);
+    //leftdpf.copyTo(disp);
+    if(debug_couts) cout<<"disparity available\n";
+    dcv.notify_one();
+    
+    if(publish_disparity){
+        disp_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::disp).toImageMsg();
+        disp_pub.publish(disp_msg);
+    }
   }
-  /////////////////////
 
 }
 
 void publishPointCloud(ros::Publisher _m_octomap_pub) {
-  
-  //Mat V = Mat(4, 1, CV_64FC1);
-
-  while(run_thread){
-
-    Eigen::MatrixXd V(4,1);
-    Eigen::MatrixXd pos;
-    Eigen::MatrixXd point3d_cam(3,1), point3d_robot(3,1);
-    double X, Y, Z;
-    //Mat pos = Mat(4, 1, CV_64FC1);
-    
-    octomap_msgs::Octomap map_msg; 
-
-    std::shared_ptr<octomap::OcTree> map_ptr = std::make_shared<octomap::OcTree>(kMapResolution);
-
-    octomap::OcTree* tree = map_ptr.get();
-    map_msg.header.stamp = ros::Time::now();
+    octomap_msgs::Octomap map_msg;
     map_msg.header.frame_id = "Hedwig";
     map_msg.binary = true;
     map_msg.id = "OcTree";
     map_msg.resolution = kMapResolution;
+    std::shared_ptr<octomap::OcTree> map_ptr = std::make_shared<octomap::OcTree>(kMapResolution);
+    octomap::OcTree* tree = map_ptr.get();
+
+    while(run_thread){
+        
     
+    std::unique_lock<std::mutex> lk(dmtx);
+    dcv.wait(lk);
+    if(debug_couts) cout<<"octomap wait finished\n";
+    disp.copyTo(disp_c);
+    lk.unlock();
     
-      ////
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < ::left.cols; i++) {
-      for (int j = 0; j < ::left.rows; j++) {
-        //cout<<" Called_ppc"<<endl;
-        // mtx.lock();
-       // cout<<" Called_ppc2"<<endl;
-        while(!isDispAvailable) {
-         // mtx.unlock();
-          cout<<"Disp not available"<<endl;
-          usleep(1000);
-          //mtx.lock();
-        }
-        int d = disp.at<uchar>(j,i);
-        isDispAvailable = true;
-        // mtx.unlock();
-        // if low disparity, then ignore
-        //cout<<"Crossed barriers"<<endl;
-        if (d < 2) {
-          
-          continue;
-        }
+    map_msg.header.stamp = ros::Time::now();
+    int i, j, d;
+    int numthreads = 1;
+    //cout << "Max thread" << omp_get_max_threads() <<"\n";
+    omp_set_num_threads(numthreads);
+    //cout << "Max thread" << omp_get_max_threads() <<"\n";
+    
+    Eigen::Matrix3d R_quad_world = quad_rot.matrix();
+    Eigen::MatrixXd V(4,1);
+    Eigen::MatrixXd pos;
+    Eigen::MatrixXd point3d_robot(3,1);
+    Eigen::MatrixXd point_w_world;
+
+//#pragma omp parallel for collapse(2) private(d) shared(_Q,tree,R_quad_world,quad_trans)
+    for (i = 0; i < ::img_left.cols; i++) {
+      for (j = 0; j < ::img_left.rows; j++) {
+        d = disp_c.at<uchar>(j,i);
+        if (d < 2) continue;
 
         // V is the vector to be multiplied to Q to get
         // the 3D homogenous coordinates of the image point
+    
+
         V(0,0) = (double)(i);
         V(1,0) = (double)(j);
         V(2,0) = (double)d;
         V(3,0) = 1.;
-        // cout<<"calculating pose"<<endl;
-        // cout<<V.rows()<<V.cols()<<endl;
-        //cout<<_Q.rows()<<_Q.cols()<<endl;
+
         pos = _Q * V; // 3D homogeneous coordinate
-       // cout<<"calculated----------------"<<endl;
-        X = pos(0,0) / pos(3,0);
-        Y = pos(1,0) / pos(3,0);
-        Z = pos(2,0) / pos(3,0);
-        
-
-        point3d_cam(0,0) = X;
-        point3d_cam(1,0) = Y;
-        point3d_cam(2,0) = Z;
+        //cout << i << " " << j << "\n";
+        //cout << omp_get_thread_num() << "\n";        
+        point3d_robot(0,0) = pos(0,0) / pos(3,0);
+        point3d_robot(1,0) = pos(1,0) / pos(3,0);
+        point3d_robot(2,0) = pos(2,0) / pos(3,0);
         // transform 3D point from camera frame to robot frame
-        point3d_robot = _XR * point3d_cam + _XT;
-        //cout<<"robot"<<endl;
+        //point3d_robot = _XR * point3d_cam + _XT;
         //transform from robot frame to world frame
-        Eigen::Matrix3d R_quad_world = quad_rot.matrix();
-        Eigen::MatrixXd point_w_world = R_quad_world * point3d_robot;
-        point_w_world = point_w_world + quad_trans;
-
-        //cout<<point_w_world(0,0)<<endl;
-
-        
-        tree->updateNode(point_w_world(0,0), point_w_world(1,0), point_w_world(2,0), true);
-        //cout<< "end" <<i<<endl;
+        point_w_world = R_quad_world * point3d_robot + quad_trans;
+        if(point3d_robot(2,0) > 0)
+        //tree->updateNode(point_w_world(0,0), point_w_world(1,0), point_w_world(2,0), true);
+        tree->updateNode(point3d_robot(0,0), point3d_robot(1,0), point3d_robot(2,0), true);
       }
     }
-    //cout<<"published---------->>>>>>"<<endl;
-    //tree->updateInnerOccupancy();
-    octomap_msgs::binaryMapToMsg(*(tree), map_msg);
-    // if (!dmap.empty()) {
-    //   sensor_msgs::ImagePtr disp_msg;
-    //   disp_msg = cv_bridge::CvImage(std_msgs::Header(), "mono8", dmap).toImageMsg();
-    //   dmap_pub.publish(disp_msg);
-    // }
-    
+    if(debug_couts) cout<<"octomap processed\n";
+    octomap_msgs::binaryMapToMsg(*(tree), map_msg);    
     _m_octomap_pub.publish(map_msg);
     
   }
 }
 
-void findRectificationMap(FileStorage& calib_file, Size finalSize) {
+
+void findRectificationMap(Size finalSize) {
+
   Rect validRoi[2];
   cout << "Starting rectification" << endl;
-  stereoRectify(K1, D1, K2, D2, calib_img_size, R, Mat(T), R1, R2, P1, P2, Q, 
-                CV_CALIB_ZERO_DISPARITY, 0, finalSize, &validRoi[0], &validRoi[1]);
+  //stereoRectify(K1, D1, K2, D2, calib_img_size, R, Mat(T), R1, R2, P1, P2, Q, 
+   //             CV_CALIB_ZERO_DISPARITY, 0, finalSize, &validRoi[0], &validRoi[1]);
   cv::initUndistortRectifyMap(K1, D1, R1, P1, finalSize, CV_32F, lmapx, lmapy);
   cv::initUndistortRectifyMap(K2, D2, R2, P2, finalSize, CV_32F, rmapx, rmapy);
   cout << "Done rectification" << endl;
@@ -261,6 +262,7 @@ void imgCallback(const sensor_msgs::ImageConstPtr& msg_left, const sensor_msgs::
 void pose_cb(const geometry_msgs::PoseStampedConstPtr& msg) {
   
 
+
   quad_trans(0) = msg->pose.position.x;
   quad_trans(1) = msg->pose.position.y;
   quad_trans(2) = msg->pose.position.z;
@@ -276,23 +278,43 @@ void extract_left_right(const cv::Mat & raw)  {
   // raw[1] -> right[0]
   cv::mixChannels( &raw, 1, out, 2, from_to, 2 );
 }
+void calculateQ() {
+
+    _Q.setZero();
+    _Q(0, 0) = 1.0;
+    _Q(1, 1) = 1.0;
+    _Q(0, 3) = -K1.at<double>(0,2);
+    _Q(1, 3) = -K1.at<double>(1,2);
+    double focal_length = (K1.at<double>(0,0) + K1.at<double>(1,1))/2;
+    _Q(2, 3) = focal_length;
+    double T = P2.at<double>(0,3)/focal_length;
+    _Q(3, 2) = -1./T;
+    _Q(3, 3) = (K1.at<double>(0,2)- K2.at<double>(0,2)) / T;
+}
+void extract_left_right(const cv::Mat & raw)  {
+  Mat out[] = {::left, ::right};
+  // raw[0] -> left[0],
+  // raw[1] -> right[0]
+  cv::mixChannels( &raw, 1, out, 2, from_to, 2 );
+}
+
+
 
 
 
 int main(int argc, char** argv) {
-  
-  ros::init(argc, argv, "demo");
-  ros::NodeHandle nh;
-  image_transport::ImageTransport it(nh);
 
-  elas = new StereoEfficientLargeScale(0,128);
-  
-  const char* left_img_topic;
-  const char* right_img_topic;
-  const char* calib_file_name;
-  int calib_width, calib_height, out_width, out_height;
-  
-  static struct poptOption options[] = {
+    //Eigen::initParallel();
+    ros::init(argc, argv, "demo");
+    ros::NodeHandle nh;
+    image_transport::ImageTransport it(nh);
+
+    const char* left_img_topic;
+    const char* right_img_topic;
+    const char* calib_file_name;
+    int calib_width, calib_height, out_width, out_height;
+
+    static struct poptOption options[] = {
     { "left_topic",'l',POPT_ARG_STRING,&left_img_topic,0,"Left image topic name","STR" },
     { "right_topic",'r',POPT_ARG_STRING,&right_img_topic,0,"Right image topic name","STR" },
     { "calib_file",'c',POPT_ARG_STRING,&calib_file_name,0,"Stereo calibration file name","STR" },
@@ -303,91 +325,126 @@ int main(int argc, char** argv) {
     { "video_stream",'s',POPT_ARG_INT,&stream,0,"Specify the video stream","NUM" },
     POPT_AUTOHELP
     { NULL, 0, 0, NULL, 0, NULL, NULL }
-  };
+    };
 
-  POpt popt(NULL, argc, argv, options, 0);
-  int c;
-  while((c = popt.getNextOpt()) >= 0) {}
-  
-  calib_img_size = Size(calib_width, calib_height);
-  out_img_size = Size(out_width, out_height);
-  
-  calib_file = FileStorage(calib_file_name, FileStorage::READ);
-  calib_file["K1"] >> K1;
-  calib_file["K2"] >> K2;
-  calib_file["D1"] >> D1;
-  calib_file["D2"] >> D2;
-  calib_file["R"] >> R;
-  calib_file["T"] >> T;
-  calib_file["XR"] >> XR;
-  calib_file["XT"] >> XT;
-  
-  findRectificationMap(calib_file, out_img_size);
+    POpt popt(NULL, argc, argv, options, 0);
+    int c;
+    while((c = popt.getNextOpt()) >= 0) {}
 
-  cv2eigen(Q,_Q);
-  cv2eigen(XR,_XR);
-  cv2eigen(XT,_XT);
+    calib_file = FileStorage(calib_file_name, FileStorage::READ);
+    calib_file["K1"] >> K1;
+    calib_file["K2"] >> K2;
+    calib_file["D1"] >> D1;
+    calib_file["D2"] >> D2;
+    calib_file["R1"] >> R1;
+    calib_file["R2"] >> R2;
+    calib_file["P1"] >> P1;
+    calib_file["P2"] >> P2;
+    calib_file["XR"] >> XR;
+    calib_file["XT"] >> XT;
+    calib_file["SF"] >> scale_factor;
 
-  cv::VideoCapture cap(stream);
-  cap.set(CV_CAP_PROP_CONVERT_RGB, false);
+    calib_img_size = Size((int)(o_width*scale_factor),(int)(o_height*scale_factor));
+    out_img_size = Size((int)(o_width*scale_factor),(int)(o_height*scale_factor));
+    
+    K1.at<double>(0,0) = K1.at<double>(0,0)*scale_factor;
+    K1.at<double>(0,2) = K1.at<double>(0,2)*scale_factor;
+    K1.at<double>(1,1) = K1.at<double>(1,1)*scale_factor;
+    K1.at<double>(1,2) = K1.at<double>(1,2)*scale_factor;
 
-  isDispAvailable = true;
-  run_thread = true;
+    K2.at<double>(0,0) = K2.at<double>(0,0)*scale_factor;
+    K2.at<double>(0,2) = K2.at<double>(0,2)*scale_factor;
+    K2.at<double>(1,1) = K2.at<double>(1,1)*scale_factor;
+    K2.at<double>(1,2) = K2.at<double>(1,2)*scale_factor;
 
-  // Check if camera opened successfully
-  if(!cap.isOpened()){
+    P1.at<double>(0,0) = P1.at<double>(0,0)*scale_factor;
+    P1.at<double>(0,2) = P1.at<double>(0,2)*scale_factor;
+    P1.at<double>(1,1) = P1.at<double>(1,1)*scale_factor;
+    P1.at<double>(1,2) = P1.at<double>(1,2)*scale_factor;
+
+    P2.at<double>(0,0) = P2.at<double>(0,0)*scale_factor;
+    P2.at<double>(0,2) = P2.at<double>(0,2)*scale_factor;
+    P2.at<double>(0,3) = P2.at<double>(0,3)*scale_factor;
+    P2.at<double>(1,1) = P2.at<double>(1,1)*scale_factor;
+    P2.at<double>(1,2) = P2.at<double>(1,2)*scale_factor;
+    
+    cout << "Scale Factor: " << scale_factor << endl;
+
+    elas = new StereoEfficientLargeScale(0,(int)(max_disp*scale_factor));
+    findRectificationMap(out_img_size);
+
+    //cv2eigen(Q,_Q);
+    calculateQ();
+    cv2eigen(XR,_XR);
+    cv2eigen(XT,_XT);
+
+    cv::VideoCapture cap(stream);
+    cap.set(CV_CAP_PROP_CONVERT_RGB, false);
+
+    run_thread = true;
+
+    // Check if camera opened successfully
+    if(!cap.isOpened()){
     std::cout << "Error opening video stream\n" << std::endl;
     return -1;
-  }
-  else
+    }
+    else
      std::cout << "Opened video stream\n" << std::endl;
 
-  // First Image
-  cv::Mat frame,frame_in;
-  
-  cap >> frame_in; if (frame_in.empty()) return -1;
-  
-  cv::Size s(188,120);
-  cv::resize(frame_in, frame, s);
-  
-  ::left = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
-  ::right = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
-  ::disp = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
- 
-  _m_octomap_pub = nh.advertise<octomap_msgs::Octomap>("/hedwig/map", 1);
-  _global_pose = nh.subscribe("/mavros/local_position/pose", 1, &pose_cb);
+    // First Image
+    cv::Mat frame,frame_in;
 
-  // dmap_pub = it.advertise("/camera/left/disparity_map", 1);
-  std::thread t1(generateDisparityMap);//thread 1
-  //cout<<" Called t1"<<endl;
-  std::thread t2(publishPointCloud,_m_octomap_pub);//thread 2
-  //cout<<" Called t2"<<endl;
-  
-  ros::Rate r(8);
-  while(nh.ok()) {
+    cap >> frame_in; if (frame_in.empty()) return -1;
 
-    cap >> frame_in; if (frame_in.empty()) break;
+    cv::Size s((int)(o_width*scale_factor),(int)(o_height*scale_factor));
     cv::resize(frame_in, frame, s);
-    extract_left_right(frame);
-    //cout<<"Extracted images"<<endl;
-    //master(left,right);
-    ros::spinOnce();
-    r.sleep();
-}
-//run_thread = false;
-t1.join();
-t2.join();
 
-  // message_filters::Subscriber<sensor_msgs::Image> sub_img_left(nh, "camera/left_image", 1);
-  // message_filters::Subscriber<sensor_msgs::Image> sub_img_right(nh, "camera/right_image", 1);
-  
-  // typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> SyncPolicy;
-  // message_filters::Synchronizer<SyncPolicy> sync(SyncPolicy(10), sub_img_left, sub_img_right);
-  // sync.registerCallback(boost::bind(&imgCallback, _1, _2));
+    ::left = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+    ::right = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+    ::img_left = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+    ::img_right = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
+    ::disp = cv::Mat::zeros(frame.rows, frame.cols, CV_8UC1);
 
-  // f = boost::bind(&paramsCallback, _1, _2);
-  // server.setCallback(f); 
+    _m_octomap_pub = nh.advertise<octomap_msgs::Octomap>("/hedwig/map", 1);
+    _global_pose = nh.subscribe("/mavros/local_position/pose", 1, &pose_cb);
+    dmap_pub_l = it.advertise("/camera/left/image_raw", 1);
+    dmap_pub_r = it.advertise("/camera/right/image_raw", 1);
+    disp_pub = it.advertise("/camera/disparity/image_raw", 1);
+    std::thread t1(generateDisparityMap);//thread 1
+    //cout<<" Called t1"<<endl;
+    std::thread t2(publishPointCloud,_m_octomap_pub);//thread 2
+    //cout<<" Called t2"<<endl;
 
-  delete elas;
-  return 0;
+    ros::Rate r(50);
+    while(nh.ok()) {
+        cap >> frame_in; if (frame_in.empty()) break;
+        cv::resize(frame_in, frame, s);
+
+        std::lock_guard<std::mutex> lk(mtx);    
+        extract_left_right(frame);    
+        remap(::left,::img_left , lmapx, lmapy, cv::INTER_LINEAR);
+        remap(::right, ::img_right, rmapx, rmapy, cv::INTER_LINEAR);
+
+
+        disp_msg_l = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::img_left).toImageMsg();
+        dmap_pub_l.publish(disp_msg_l);
+        disp_msg_r = cv_bridge::CvImage(std_msgs::Header(), "mono8", ::img_right).toImageMsg();
+        dmap_pub_r.publish(disp_msg_r);
+
+        if(debug_couts) cout<<"finished grabbing image\n";
+
+        mcv.notify_one();
+
+
+        ros::spinOnce();
+        r.sleep();
+    }
+    //run_thread = false;
+    //t1.terminate();
+    //t2.terminate();
+    t1.join();
+    t2.join();
+
+    delete elas;
+    return 0;
 }

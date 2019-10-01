@@ -89,7 +89,9 @@ void Elas::process (uint8_t* I1_,uint8_t* I2_,float* D1,float* D2,const int32_t*
 computeDisparity(p_support,tri_1,disparity_grid_1,grid_dims,desc1.I_desc,desc2.I_desc,0,D1);
 computeDisparity(p_support,tri_2,disparity_grid_2,grid_dims,desc1.I_desc,desc2.I_desc,1,D2);
 
-
+param.postprocess_only_left = true;
+//param.filter_adaptive_mean = false;
+//param.filter_median = false;
   
 #ifdef PROFILE
   timer.start("Matching");
@@ -106,7 +108,7 @@ computeDisparity(p_support,tri_2,disparity_grid_2,grid_dims,desc1.I_desc,desc2.I
 #ifdef PROFILE
   timer.start("Remove Small Segments");
 #endif
-  gapInterpolation(D1);
+  //gapInterpolation(D1);
   if (!param.postprocess_only_left)
     gapInterpolation(D2);
 
@@ -1547,10 +1549,10 @@ void StereoEfficientLargeScale::process(cv::Mat& leftim, cv::Mat& rightim, cv::M
 
 	Mat disp;
 	Mat(leftdpf(cv::Rect(bd,0,leftim.cols,leftim.rows))).copyTo(disp);
-	disp.convertTo(leftdisp,CV_16S,16);
+	disp.convertTo(leftdisp,CV_16S,1.0);
 	Mat(rightdpf(cv::Rect(bd,0,leftim.cols,leftim.rows))).copyTo(disp);
 
-	disp.convertTo(rightdisp,CV_16S,16);
+	disp.convertTo(rightdisp,CV_16S,1.0);
 }
 
 void StereoEfficientLargeScale::process(cv::Mat& leftim, cv::Mat& rightim, cv::Mat& leftdisp, int bd)
